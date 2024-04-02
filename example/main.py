@@ -2,53 +2,48 @@
 
 # TVM_LOG_DEBUG=1 python3 -u main.py 2>&1 | tee dump.log
 
+# TVM
 import tvm
 from tvm import relay
-
-import numpy as np
-
 from tvm.contrib.download import download_testdata
+
+# Others
+import numpy as np
+from sklearn import datasets            # type: ignore
 
 # PyTorch imports
 import torch
-import torchvision
+from torch import nn
+from torch import Tensor
 
-model_name = "resnet18"
-model = getattr(torchvision.models, model_name)(pretrained=True)
-model = model.eval()
+# custom simple model
+class NN(nn.Module):
+    def __init__(self, input_size: int, H1: int, output_size: int):
+        super().__init__()
+        self.linear = nn.Linear(input_size, H1)
+        self.linear2 = nn.Linear(H1, output_size)
+    
+    def forward(self, x: 'Tensor') -> 'Tensor':
+        x = torch.sigmoid(self.linear(x))
+        x = torch.sigmoid(self.linear2(x))
+        return x
 
-# We grab the TorchScripted model via tracing
-input_shape = [1, 3, 224, 224]
+model = NN(2, 10, 1)
+
+# get scripted model using tracing
+input_shape = [1000, 2]
 input_data = torch.randn(input_shape)
 scripted_model = torch.jit.trace(model, input_data).eval()
 
-# load the test image
-from PIL import Image
-
-img_url = "https://github.com/dmlc/mxnet.js/blob/main/data/cat.png?raw=true"
-img_path = download_testdata(img_url, "cat.png", module="data")
-img = Image.open(img_path).resize((224, 224))
-
-# Preprocess the image and convert to tensor
-from torchvision import transforms
-
-my_preprocess = transforms.Compose(
-    [
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ]
-)
-img = my_preprocess(img)
-img = np.expand_dims(img, 0)
-
+# get data
+x, y = datasets.make_circles(n_samples=1000, random_state=42, noise=0.04)
+x_data = torch.FloatTensor(x)
 
 # import the graph to relay
 input_name = "input0"
-shape_list = [(input_name, img.shape)]
+assert input_shape == list(x_data.numpy().shape)
+shape_list = [(input_name, x_data.numpy().shape)]
 mod, params = relay.frontend.from_pytorch(scripted_model, shape_list)
-
 
 # relay build
 target = tvm.target.Target("llvm", host="llvm")
@@ -61,55 +56,23 @@ from tvm.contrib import graph_executor
 
 dtype = "float32"
 m = graph_executor.GraphModule(lib["default"](dev))
-# Set inputs
-m.set_input(input_name, tvm.nd.array(img.astype(dtype)))
+m.set_input(input_name, tvm.nd.array(x_data.numpy().astype(dtype)))
+
 # Execute
 m.run()
+
 # Get outputs
 tvm_output = m.get_output(0)
 
-synset_url = "".join(
-    [
-        "https://raw.githubusercontent.com/Cadene/",
-        "pretrained-models.pytorch/master/data/",
-        "imagenet_synsets.txt",
-    ]
-)
-synset_name = "imagenet_synsets.txt"
-synset_path = download_testdata(synset_url, synset_name, module="data")
-with open(synset_path) as f:
-    synsets = f.readlines()
-
-synsets = [x.strip() for x in synsets]
-splits = [line.split(" ") for line in synsets]
-key_to_classname = {spl[0]: " ".join(spl[1:]) for spl in splits}
-
-class_url = "".join(
-    [
-        "https://raw.githubusercontent.com/Cadene/",
-        "pretrained-models.pytorch/master/data/",
-        "imagenet_classes.txt",
-    ]
-)
-class_name = "imagenet_classes.txt"
-class_path = download_testdata(class_url, class_name, module="data")
-with open(class_path) as f:
-    class_id_to_key = f.readlines()
-
-class_id_to_key = [x.strip() for x in class_id_to_key]
-
 # Get top-1 result for TVM
-top1_tvm = np.argmax(tvm_output.numpy()[0])
-tvm_class_key = class_id_to_key[top1_tvm]
+top1_tvm = np.argmax(tvm_output.numpy())
 
 # Convert input to PyTorch variable and get PyTorch result for comparison
 with torch.no_grad():
-    torch_img = torch.from_numpy(img)
-    output = model(torch_img)
+    output = model(x_data)
 
     # Get top-1 result for PyTorch
     top1_torch = np.argmax(output.numpy())
-    torch_class_key = class_id_to_key[top1_torch]
 
-print("Relay top-1 id: {}, class name: {}".format(top1_tvm, key_to_classname[tvm_class_key]))
-print("Torch top-1 id: {}, class name: {}".format(top1_torch, key_to_classname[torch_class_key]))
+print("Relay top-1 id: {}".format(top1_tvm))
+print("Torch top-1 id: {}".format(top1_torch))
